@@ -17,7 +17,7 @@ ENDIF()
 
 add_library(exprtk INTERFACE)
 target_include_directories(exprtk INTERFACE exprtk)
-set_target_properties(exprtk PROPERTIES SYSTEM TRUE)
+set_target_properties(exprtk PROPERTIES INTERFACE_SYSTEM TRUE)
 
 build_plugin(xpressive
 	Xpressive.cpp

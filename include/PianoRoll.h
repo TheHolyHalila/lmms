@@ -253,6 +253,7 @@ protected slots:
 	void constrainNoteLengths(bool constrainMax);
 
 	void changeSnapMode();
+	void humanizeSelectedNotes();
 
 
 signals:
@@ -583,6 +584,7 @@ signals:
 
 private slots:
 	void updateAfterMidiClipChange();
+	void onAiButtonPressed();
 	void ghostClipSet( bool state );
 	void exportMidiClip();
 	void importMidiClip();

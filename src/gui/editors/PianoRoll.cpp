@@ -26,8 +26,9 @@
 
 #include "PianoRoll.h"
 
-#include <QtMath>
 #include <QApplication>
+#include <QDialog>
+#include <QFile>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -39,25 +40,30 @@
 #include <QPushButton>
 #include <QScrollBar>
 #include <QStyleOption>
+#include <QTemporaryFile>
+#include <QTextEdit>
 #include <QToolButton>
-
+#include <QVBoxLayout>
+#include <QtCore/qmath.h>
+#include <QtNetwork/QNetworkAccessManager>
+#include <QtNetwork/QNetworkReply>
+#include <QtNetwork/QNetworkRequest>
 #include <cmath>
 #include <utility>
 
-#include "AutomationEditor.h"
 #include "ActionGroup.h"
+#include "AutomationEditor.h"
 #include "Clipboard.h"
 #include "ComboBox.h"
 #include "ConfigManager.h"
 #include "DataFile.h"
 #include "DeprecationHelper.h"
 #include "DetuningHelper.h"
-#include "embed.h"
-#include "GuiApplication.h"
+#include "FileDialog.h"
 #include "FontHelper.h"
+#include "GuiApplication.h"
 #include "InstrumentTrack.h"
 #include "KeyboardShortcuts.h"
-#include "lmms_math.h"
 #include "MainWindow.h"
 #include "MidiClip.h"
 #include "PatternStore.h"
@@ -68,8 +74,8 @@
 #include "StepRecorderWidget.h"
 #include "TextFloat.h"
 #include "TimeLineWidget.h"
-#include "FileDialog.h"
-
+#include "embed.h"
+#include "lmms_math.h"
 
 namespace lmms
 {
@@ -2372,6 +2378,7 @@ void PianoRoll::mouseReleaseEvent( QMouseEvent * me )
 				m_midiClip->instrumentTrack()->pianoModel()->
 						handleKeyRelease( note->key() );
 				pauseChordNotes(note->key());
+
 				note->setIsPlaying( false );
 			}
 		}
@@ -3519,7 +3526,7 @@ void PianoRoll::paintEvent(QPaintEvent * pe )
 		}
 
 		// draw marked semitones after the grid
-		for(x = 0; x < m_markedSemiTones.size(); ++x)
+		for (x = 0; x < m_markedSemiTones.size(); ++x)
 		{
 			const int key_num = m_markedSemiTones.at(x);
 			const int y = keyAreaBottom() - 1 - m_keyLineHeight *
@@ -3916,7 +3923,7 @@ void PianoRoll::updateScrollbars()
 		SCROLLBAR_SIZE,
 		height() - PR_TOP_MARGIN - SCROLLBAR_SIZE
 	);
-	int pianoAreaHeight = keyAreaBottom() - PR_TOP_MARGIN;
+	int pianoAreaHeight = keyAreaBottom() - keyAreaTop();
 	int numKeysVisible = pianoAreaHeight / m_keyLineHeight;
 	m_totalKeysToScroll = qMax(0, NumKeys - numKeysVisible);
 	m_topBottomScroll->setRange(0, m_totalKeysToScroll);
@@ -4032,6 +4039,8 @@ void PianoRoll::wheelEvent(QWheelEvent * we )
 			q++;
 		}
 		q = qBound( 0, q, m_quantizeModel.size() - 1 );
+
+
 		m_quantizeModel.setValue( q );
 	}
 	else if( we->modifiers() & Qt::ControlModifier && we->modifiers() & Qt::ShiftModifier )
@@ -4942,6 +4951,104 @@ void PianoRoll::changeSnapMode()
 	m_gridMode = static_cast<GridMode>(m_snapModel.value());
 }
 
+void PianoRoll::humanizeSelectedNotes()
+{
+	if (!hasValidMidiClip()) { return; }
+
+	NoteVector notes = getSelectedNotes();
+	if (notes.empty()) { notes = m_midiClip->notes(); }
+
+	// Add a journal checkpoint for undo
+	m_midiClip->addJournalCheckPoint();
+
+	// Parameters for humanization
+	const int maxTimingShift = quantization() / 8; // up to 1/8 of quantization
+	const int maxVelocityShift = 8;				   // up to +/-8 velocity
+
+	for (Note* note : notes)
+	{
+		// Randomize timing (position)
+		int timingShift = (qrand() % (2 * maxTimingShift + 1)) - maxTimingShift;
+		note->setPos(note->pos() + timingShift);
+
+		// Randomize velocity
+		int velocityShift = (qrand() % (2 * maxVelocityShift + 1)) - maxVelocityShift;
+		int newVelocity = qBound(MinVolume, static_cast<volume_t>(note->getVolume() + velocityShift), MaxVolume);
+		note->setVolume(newVelocity);
+	}
+
+	m_midiClip->rearrangeAllNotes();
+	m_midiClip->dataChanged();
+	update();
+	getGUI()->songEditor()->update();
+	Engine::getSong()->setModified();
+}
+
+void PianoRollWindow::onAiButtonPressed()
+{
+	// Simple multi-line text input dialog
+	QDialog dialog(this);
+	dialog.setWindowTitle(tr("AI Assistant"));
+	dialog.setMinimumSize(500, 300);
+
+	QVBoxLayout* layout = new QVBoxLayout(&dialog);
+	QTextEdit* textEdit = new QTextEdit(&dialog);
+	textEdit->setPlaceholderText(tr("Ask AI..."));
+	textEdit->setMinimumHeight(120);
+	layout->addWidget(textEdit);
+
+	QPushButton* sendButton = new QPushButton(tr("Send"), &dialog);
+	layout->addWidget(sendButton);
+
+	QString aiText;
+	QObject::connect(sendButton, &QPushButton::clicked, [&]() {
+		aiText = textEdit->toPlainText();
+		dialog.accept();
+	});
+
+	if (dialog.exec() == QDialog::Accepted && !aiText.isEmpty())
+	{
+		QNetworkAccessManager* manager = new QNetworkAccessManager(this);
+		QNetworkRequest request(QUrl("http://localhost:15521"));
+		request.setHeader(QNetworkRequest::ContentTypeHeader, "text/plain");
+
+		QNetworkReply* reply = manager->post(request, aiText.toUtf8());
+		QEventLoop loop;
+		connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+		loop.exec();
+
+		if (reply->error() == QNetworkReply::NoError)
+		{
+			QByteArray payload = reply->readAll();
+			QTemporaryFile tempFile;
+			tempFile.setFileTemplate(QDir::tempPath() + "/ai_clip_XXXXXX.xpt");
+			if (tempFile.open())
+			{
+				tempFile.write(payload);
+				tempFile.flush();
+				tempFile.close();
+				// Load the .xpt file as a clip
+				DataFile dataFile(tempFile.fileName());
+				if (!dataFile.head().isNull())
+				{
+					TimePos pos = m_editor->m_midiClip->startPosition();
+					m_editor->m_midiClip->loadSettings(dataFile.content());
+					m_editor->m_midiClip->movePosition(pos);
+					TextFloat::displayMessage(
+						tr("AI Import Success"), tr("Imported AI clip!"), embed::getIconPixmap("project_import"), 4000);
+				}
+			}
+		}
+		else
+		{
+			QMessageBox::warning(
+				this, tr("AI Error"), tr("Failed to get clip from AI server:\n%1").arg(reply->errorString()));
+		}
+		reply->deleteLater();
+		manager->deleteLater();
+	}
+}
+
 PianoRollWindow::PianoRollWindow() :
 	Editor(true, true),
 	m_editor(new PianoRoll())
@@ -4997,12 +5104,28 @@ PianoRollWindow::PianoRollWindow() :
 	notesActionsToolBar->addSeparator();
 	notesActionsToolBar->addWidget(quantizeButton);
 
+    auto humanizeButton = new QToolButton(notesActionsToolBar);
+    humanizeButton->setIcon(embed::getIconPixmap("humanize"));
+    humanizeButton->setToolTip(tr("Humanize selected notes"));
+    connect(humanizeButton, &QToolButton::clicked, [this]() {
+        m_editor->humanizeSelectedNotes();
+    });
+    notesActionsToolBar->addWidget(humanizeButton);
+
+    // --- Add AI Button ---
+	auto aiButton = new QToolButton(notesActionsToolBar);
+	aiButton->setIcon(embed::getIconPixmap("ai"));
+	aiButton->setToolTip(tr("AI Assistant"));
+	connect(aiButton, &QToolButton::clicked, this, &PianoRollWindow::onAiButtonPressed);
+	notesActionsToolBar->addWidget(aiButton);
+	// --- End Add AI Button ---
+
 	// -- File actions
 	DropToolBar* fileActionsToolBar = addDropToolBarToTop(tr("File actions"));
 
 	// -- File ToolButton
 	m_fileToolsButton = new QToolButton(m_toolBar);
-	m_fileToolsButton->setIcon(embed::getIconPixmap("file"));
+	m_fileToolsButton->setIcon( embed::getIconPixmap( "file" ) );
 	m_fileToolsButton->setPopupMode(QToolButton::InstantPopup);
 
 	// Import / export
@@ -5126,7 +5249,7 @@ PianoRollWindow::PianoRollWindow() :
 	m_noteLenComboBox = new ComboBox( m_toolBar );
 	m_noteLenComboBox->setModel( &m_editor->m_noteLenModel );
 	m_noteLenComboBox->setFixedSize( 105, ComboBox::DEFAULT_HEIGHT );
-	m_noteLenComboBox->setToolTip( tr( "Note length") );
+	m_noteLenComboBox->setToolTip( tr( "Note length" ) );
 
 	// setup key-stuff
 	m_keyComboBox = new ComboBox(m_toolBar);
@@ -5248,24 +5371,15 @@ PianoRollWindow::PianoRollWindow() :
 	connect( m_editor, SIGNAL(currentMidiClipChanged()), this, SLOT(updateAfterMidiClipChange()));
 }
 
-
-
-
 const MidiClip* PianoRollWindow::currentMidiClip() const
 {
 	return m_editor->currentMidiClip();
 }
 
-
-
-
 void PianoRollWindow::setGhostMidiClip( MidiClip* clip )
 {
 	m_editor->setGhostMidiClip( clip );
 }
-
-
-
 
 void PianoRollWindow::setCurrentMidiClip( MidiClip* clip )
 {
@@ -5285,40 +5399,25 @@ void PianoRollWindow::setCurrentMidiClip( MidiClip* clip )
 	}
 }
 
-
-
-
 bool PianoRollWindow::isRecording() const
 {
 	return m_editor->isRecording();
 }
-
-
-
 
 int PianoRollWindow::quantization() const
 {
 	return m_editor->quantization();
 }
 
-
-
-
 void PianoRollWindow::play()
 {
 	m_editor->play();
 }
 
-
-
-
 void PianoRollWindow::stop()
 {
 	m_editor->stop();
 }
-
-
-
 
 void PianoRollWindow::record()
 {
@@ -5326,9 +5425,6 @@ void PianoRollWindow::record()
 
 	m_editor->record();
 }
-
-
-
 
 void PianoRollWindow::recordAccompany()
 {
@@ -5357,16 +5453,10 @@ void PianoRollWindow::stopRecording()
 	m_editor->stopRecording();
 }
 
-
-
-
 void PianoRollWindow::reset()
 {
 	m_editor->reset();
 }
-
-
-
 
 void PianoRollWindow::saveSettings( QDomDocument & doc, QDomElement & de )
 {
